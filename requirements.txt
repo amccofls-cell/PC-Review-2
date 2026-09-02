@@ -1,0 +1,5 @@
+streamlit>=1.35.0
+requests>=2.31.0
+pandas>=2.0.0
+python-pptx>=0.6.23
+openpyxl>=3.1.0

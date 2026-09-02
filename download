@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Streamlit secrets (실제 키 — 절대 커밋 금지)
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 배포 산출물
+*.zip
