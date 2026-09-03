@@ -2,21 +2,31 @@
 """
 MFDS(식품의약품안전처) 의약품 허가사항 조회 모듈.
 
-엔드포인트와 필드명은 개발 명세서 4-1장을 그대로 사용한다(추측 금지).
-- 목록 조회: http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07
+엔드포인트(HTTPS 고정 — 사용자 제공 · 명세서 4-1장):
+- 목록 조회: https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07
 - 상세 조회: https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06
+
+v4.1 변경점:
+- 모든 호출은 HTTPS. HTTP(포트 80) 잔재 없음 — 이전 ConnectTimeout 원인 제거.
+- 검색은 API 호출 없이 캐시(JSON) 로컬 필터링.
+  fetch_all_products() 로 전체 허가품목을 1회 적재해 data/cache/mfds_products.json 에 저장한다.
+- serviceKey 는 이미 URL 인코딩된 키(예: %2B)의 이중 인코딩을 막기 위해 unquote 로 1회 정규화.
+- 연결 오류 시 최대 3회 재시도 (1.5s × n 지연).
 
 EE_DOC_DATA / UD_DOC_DATA / NB_DOC_DATA 는 JSON 안에 들어 있는 중첩 XML 문자열이다.
 ElementTree 로 파싱하고, NB_DOC_DATA 는 섹션 타이틀 키워드로 분리한다(명세서 4-1장 키워드표).
 """
 import re
-import requests
+import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 
-LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
+import requests
+
+LIST_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 LIST_ROWS = 500          # 명세서 권장값
-MAX_PAGES = 10           # 최대 5,000건까지 전체 페이지를 돌며 키워드 필터링
+MAX_FETCH_PAGES = 400    # 전체 적재 상한 (500 × 400 = 200,000건)
 
 # 명세서 4-1장 상세 응답 필드 매핑 (내부 필드명 → MFDS 원본 필드)
 FIELD_MAP = [
@@ -68,6 +78,18 @@ class MfdsApiError(Exception):
     """MFDS API 호출/응답 관련 오류 (사용자에게 그대로 노출)"""
 
 
+def prep_service_key(service_key):
+    """
+    data.go.kr 인증키 정규화.
+    데이터포털에서 발급받은 키는 이미 URL 인코딩 되어 있으므로(%2B 등),
+    requests 가 다시 인코딩할 때 이중 인코딩이 되지 않도록 1회 unquote 한다.
+    """
+    key = str(service_key or "").strip()
+    if not key:
+        return key
+    return urllib.parse.unquote(key)
+
+
 def _get_body(data):
     """data.go.kr JSON 봉투에서 body 추출 (header/body 또는 response/header/body 모두 지원)."""
     body = data.get("body") if isinstance(data, dict) else None
@@ -91,12 +113,22 @@ def _extract_items(body):
     return []
 
 
-def _get_json(url, params, timeout=30):
-    """data.go.kr 호출 공통. 인증/서버 오류는 예외로 변환."""
-    try:
-        resp = requests.get(url, params=params, timeout=timeout)
-    except requests.RequestException as exc:
-        raise MfdsApiError(f"MFDS 서버에 연결하지 못했습니다: {exc}")
+def _get_json(url, params, timeout=30, retries=3):
+    """data.go.kr 호출 공통. HTTPS + 키 이중인코딩 방지 + 연결 재시도."""
+    params = dict(params)
+    params["serviceKey"] = prep_service_key(params.get("serviceKey", ""))
+    last_exc = None
+    resp = None
+    for attempt in range(max(1, retries)):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    if resp is None:
+        raise MfdsApiError(f"MFDS 서버에 연결하지 못했습니다 (HTTPS, {retries}회 시도): {last_exc}")
     try:
         data = resp.json()
     except ValueError:
@@ -105,12 +137,121 @@ def _get_json(url, params, timeout=30):
         raise MfdsApiError(f"MFDS 응답을 해석하지 못했습니다(인증키 오류 또는 서비스 점검 가능): {msg}")
     if not isinstance(data, dict):
         raise MfdsApiError("MFDS 응답 형식이 올바르지 않습니다.")
+    # data.go.kr 오류 봉투: {"OpenAPI_ServiceResponse":{"cmmMsgHeader":{...}}}
+    # (키 미등록·만료 시 HTTP 403 과 함께 이 형식으로 온다)
+    svc = data.get("OpenAPI_ServiceResponse")
+    if isinstance(svc, dict):
+        hdr = svc.get("cmmMsgHeader") or {}
+        err = hdr.get("errMsg") or ""
+        auth = hdr.get("returnAuthMsg") or ""
+        if err or auth:
+            raise MfdsApiError(f"MFDS API 오류: {auth or err} ({err})")
     header = data.get("header") or {}
     code = header.get("resultCode")
     if str(code) not in ("00", "0", "200"):
         msg = header.get("resultMsg") or f"resultCode={code}"
         raise MfdsApiError(f"MFDS API 오류: {msg}")
     return data
+
+
+def fetch_all_products(service_key, progress_cb=None, max_pages=MAX_FETCH_PAGES):
+    """
+    전체 허가품목 목록을 페이지네이션 끝까지 수집한다(정상 품목만, 명세서 4-1장).
+    progress_cb(진행률 0~1, 누적건수) — UI 진행률 표시용 콜백.
+    검색은 이 결과를 JSON 캐시로 저장한 뒤 로컬 필터링으로 대체한다(API 호출 없음).
+    """
+    if not service_key:
+        raise MfdsApiError("MFDS 인증키가 필요합니다. 사이드바에 입력하거나 Secrets에 설정하세요.")
+    collected, page, total = [], 1, None
+    while page <= max_pages:
+        data = _get_json(LIST_URL, {
+            "serviceKey": service_key,
+            "pageNo": page,
+            "numOfRows": LIST_ROWS,
+            "type": "json",
+        })
+        body = _get_body(data)
+        items = _extract_items(body)
+        collected.extend(items)
+        try:
+            total = int(body.get("totalCount") or 0)
+        except (TypeError, ValueError):
+            total = None
+        if progress_cb:
+            frac = min(1.0, len(collected) / total) if total else min(1.0, page / max_pages)
+            progress_cb(frac, len(collected))
+        if not items:
+            break
+        if len(items) < LIST_ROWS:
+            break
+        if total and page * LIST_ROWS >= total:
+            break
+        page += 1
+    rows = []
+    for it in collected:
+        cancel = str(it.get("CANCEL_NAME") or "").strip()
+        if cancel not in ("", "정상"):
+            continue
+        rows.append({
+            "ITEM_SEQ": str(it.get("ITEM_SEQ") or "").strip(),
+            "ITEM_NAME": str(it.get("ITEM_NAME") or "").strip(),
+            "ENTP_NAME": str(it.get("ENTP_NAME") or "").strip(),
+            "ITEM_PERMIT_DATE": str(it.get("ITEM_PERMIT_DATE") or "").strip(),
+        })
+    rows.sort(key=lambda r: r["ITEM_NAME"])
+    return rows
+
+
+def filter_by_keyword(items, keyword):
+    """캐시 항목을 키워드(제품명/제조사명 부분 일치)로 로컬 필터링. API 호출 없음."""
+    kw = str(keyword or "").strip().lower()
+    out = []
+    for it in items or []:
+        name = str(it.get("ITEM_NAME") or "").lower()
+        entp = str(it.get("ENTP_NAME") or "").lower()
+        if kw and kw not in name and kw not in entp:
+            continue
+        out.append(it)
+    return out
+
+
+def search_products(keyword, service_key):
+    """(하위호환) 전체 적재 후 로컬 필터링 — 앱에서는 사용하지 않음(캐시 기반)."""
+    items = fetch_all_products(service_key)
+    return filter_by_keyword(items, keyword)
+
+
+def get_product_detail(item_seq, service_key):
+    """
+    품목기준코드(ITEM_SEQ)로 상세 허가사항 조회.
+    반환 dict 는 명세서 4-1장 매핑표의 내부 필드명을 키로 사용한다.
+    """
+    if not service_key:
+        raise MfdsApiError("MFDS 인증키가 필요합니다. 사이드바에 입력하거나 Secrets에 설정하세요.")
+    data = _get_json(DETAIL_URL, {
+        "serviceKey": service_key,
+        "item_seq": str(item_seq).strip(),
+        "type": "json",
+    })
+    items = _extract_items(_get_body(data))
+    if not items:
+        raise MfdsApiError(f"상세 허가사항이 없습니다(품목기준코드: {item_seq}).")
+    raw = items[0]
+    out = {}
+    for internal, mfds_field in FIELD_MAP:
+        out[internal] = str(raw.get(mfds_field) or "").strip()
+    # 성분명의 대괄호 코드([A12345]) 제거 (명세서 4-1장)
+    out["성분명"] = re.sub(r"\[[^\]]*\]", "", out["성분명"]).strip()
+    out["제품명"] = str(raw.get("ITEM_NAME") or "").strip()
+    out["제조판매사"] = str(raw.get("ENTP_NAME") or "").strip()
+    out["품목기준코드"] = str(raw.get("ITEM_SEQ") or "").strip()
+    # 제형: 상세 응답에 FORM_CODE 가 있는 경우에만 사용(없으면 빈 문자열 → 검증 시 '확인불가')
+    out["제형"] = str(raw.get("FORM_CODE") or "").strip()
+    # 중첩 XML 파싱 (원문 유지, 요약 금지)
+    out["효능효과"] = docs_to_text(parse_doc_xml(out["효능효과"]))
+    out["용법용량"] = docs_to_text(parse_doc_xml(out["용법용량"]))
+    out["사용상주의사항"] = split_nb_sections(parse_doc_xml(out["사용상주의사항 전체"]))
+    return out
 
 
 def _normalize_title(text):
@@ -195,84 +336,6 @@ def split_nb_sections(pairs):
                 break
         sections[matched_key or "기타"].append(p)
     return {k: docs_to_text(v) for k, v in sections.items()}
-
-
-def search_products(keyword, service_key):
-    """
-    품목명/제조사명 부분 일치 검색.
-    CANCEL_NAME 이 '정상'인 품목만 반환한다(명세서 4-1장).
-    """
-    if not service_key:
-        raise MfdsApiError("MFDS 인증키가 설정되지 않았습니다. Streamlit Secrets에 MFDS_API_KEY(또는 DATA_GO_KOR_API_KEY)를 설정하세요.")
-    collected, page = [], 1
-    while page <= MAX_PAGES:
-        data = _get_json(LIST_URL, {
-            "serviceKey": service_key,
-            "pageNo": page,
-            "numOfRows": LIST_ROWS,
-            "type": "json",
-        })
-        body = _get_body(data)
-        items = _extract_items(body)
-        collected.extend(items)
-        try:
-            total = int(body.get("totalCount") or 0)
-        except (TypeError, ValueError):
-            total = 0
-        if not items or page * LIST_ROWS >= total:
-            break
-        page += 1
-    kw = (keyword or "").strip().lower()
-    rows = []
-    for it in collected:
-        cancel = str(it.get("CANCEL_NAME") or "").strip()
-        if cancel not in ("", "정상"):
-            continue
-        name = str(it.get("ITEM_NAME") or "").strip()
-        entp = str(it.get("ENTP_NAME") or "").strip()
-        if kw and kw not in name.lower() and kw not in entp.lower():
-            continue
-        rows.append({
-            "ITEM_SEQ": str(it.get("ITEM_SEQ") or "").strip(),
-            "ITEM_NAME": name,
-            "ENTP_NAME": entp,
-            "ITEM_PERMIT_DATE": str(it.get("ITEM_PERMIT_DATE") or "").strip(),
-        })
-    rows.sort(key=lambda r: r["ITEM_NAME"])
-    return rows
-
-
-def get_product_detail(item_seq, service_key):
-    """
-    품목기준코드(ITEM_SEQ)로 상세 허가사항 조회.
-    반환 dict 는 명세서 4-1장 매핑표의 내부 필드명을 키로 사용한다.
-    """
-    if not service_key:
-        raise MfdsApiError("MFDS 인증키가 설정되지 않았습니다. Streamlit Secrets에 MFDS_API_KEY(또는 DATA_GO_KOR_API_KEY)를 설정하세요.")
-    data = _get_json(DETAIL_URL, {
-        "serviceKey": service_key,
-        "item_seq": str(item_seq).strip(),
-        "type": "json",
-    })
-    items = _extract_items(_get_body(data))
-    if not items:
-        raise MfdsApiError(f"상세 허가사항이 없습니다(품목기준코드: {item_seq}).")
-    raw = items[0]
-    out = {}
-    for internal, mfds_field in FIELD_MAP:
-        out[internal] = str(raw.get(mfds_field) or "").strip()
-    # 성분명의 대괄호 코드([A12345]) 제거 (명세서 4-1장)
-    out["성분명"] = re.sub(r"\[[^\]]*\]", "", out["성분명"]).strip()
-    out["제품명"] = str(raw.get("ITEM_NAME") or "").strip()
-    out["제조판매사"] = str(raw.get("ENTP_NAME") or "").strip()
-    out["품목기준코드"] = str(raw.get("ITEM_SEQ") or "").strip()
-    # 제형: 상세 응답에 FORM_CODE 가 있는 경우에만 사용(없으면 빈 문자열 → 검증 시 '확인불가')
-    out["제형"] = str(raw.get("FORM_CODE") or "").strip()
-    # 중첩 XML 파싱 (원문 유지, 요약 금지)
-    out["효능효과"] = docs_to_text(parse_doc_xml(out["효능효과"]))
-    out["용법용량"] = docs_to_text(parse_doc_xml(out["용법용량"]))
-    out["사용상주의사항"] = split_nb_sections(parse_doc_xml(out["사용상주의사항 전체"]))
-    return out
 
 
 def detail_to_raw_text(detail):
