@@ -8,8 +8,9 @@
 실행:  python tests/selftest.py
 """
 import io
-import sys
 import os
+import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +20,7 @@ from pptx import Presentation
 from modules import (
     mfds_api, hira_api, drug_matcher, pptx_parser, xlsx_parser, clipboard_parser,
     table_normalizer as normalizer, rule_validator, claude_prompt_builder, result_parser,
+    cache_store,
 )
 
 PASS, FAIL = "PASS", "FAIL"
@@ -232,6 +234,105 @@ def main():
                         if re_search_key(ln):
                             hardcoded.append((path, ln.strip()[:80]))
     check("14. API 키 하드코딩 없음", len(hardcoded) == 0, hardcoded if hardcoded else "소스에 키 값 없음")
+
+    # ---- 15) v4.1 캐시 저장/로드 + 로컬 필터 (API 호출 없음) ----
+    cache_items = [
+        {"ITEM_SEQ": "A1", "ITEM_NAME": "온코정 100mg", "ENTP_NAME": "온코팜", "ITEM_PERMIT_DATE": "2020-01-01"},
+        {"ITEM_SEQ": "A2", "ITEM_NAME": "포비정", "ENTP_NAME": "한독약품", "ITEM_PERMIT_DATE": "2021-02-02"},
+    ]
+    flt = cache_store.filter_products(cache_items, "온코")
+    check("15. 로컬 키워드 필터(제품명)", len(flt) == 1 and flt[0]["ITEM_SEQ"] == "A1")
+    flt2 = cache_store.filter_products(cache_items, "한독")
+    check("15. 로컬 키워드 필터(제조사명)", len(flt2) == 1 and flt2[0]["ITEM_SEQ"] == "A2")
+    check("15. 빈 키워드 → 전체 반환", len(cache_store.filter_products(cache_items, "")) == 2)
+    tmp_cache = os.path.join(tempfile.gettempdir(), "selftest_cache_v41.json")
+    saved = cache_store.save_cache(tmp_cache, cache_items)
+    loaded = cache_store.load_cache(tmp_cache)
+    check("15. JSON 캐시 저장/로드 왕복", loaded is not None and loaded["count"] == 2
+          and loaded["items"][0]["ITEM_NAME"] == "온코정 100mg" and saved["count"] == 2)
+
+    # ---- 16) v4.1 mock 응답 — 전체 적재(품목/약가) + 상세 파싱 ----
+    from unittest import mock as _umock
+
+    def _make_resp(payload):
+        class _R:
+            def __init__(self, d):
+                self._d = d
+            def json(self):
+                return self._d
+        return _R(payload)
+
+    mfds_payload = {
+        "header": {"resultCode": "00", "resultMsg": "NORMAL"},
+        "body": {"totalCount": 2, "items": {"item": [
+            {"ITEM_SEQ": "1001", "ITEM_NAME": "온코정 100mg", "ENTP_NAME": "온코팜",
+             "CANCEL_NAME": "정상", "ITEM_PERMIT_DATE": "2020-01-01"},
+            {"ITEM_SEQ": "1002", "ITEM_NAME": "폐기약", "ENTP_NAME": "X",
+             "CANCEL_NAME": "취하", "ITEM_PERMIT_DATE": ""},
+        ]}},
+    }
+    with _umock.patch("modules.mfds_api.requests.get", return_value=_make_resp(mfds_payload)):
+        fetched = mfds_api.fetch_all_products("TESTKEY")
+    check("16. MFDS 전체 적재(mock) — 정상품목만", len(fetched) == 1 and fetched[0]["ITEM_SEQ"] == "1001")
+
+    hira_payload = {
+        "header": {"resultCode": "00", "resultMsg": "NORMAL"},
+        "body": {"totalCount": 2, "items": {"item": [
+            {"mdsCd": "1234500100000", "itmNm": "온코정 100mg", "mnfEntpNm": "온코팜",
+             "mxCprc": "50000", "payTpNm": "급여", "meftDivNo": "421"},
+            {"mdsCd": "9999900000000", "itmNm": "삭제약", "mnfEntpNm": "X",
+             "mxCprc": "1", "payTpNm": "삭제", "meftDivNo": ""},
+        ]}},
+    }
+    with _umock.patch("modules.hira_api.requests.get", return_value=_make_resp(hira_payload)):
+        hp = hira_api.fetch_all_drug_prices("TESTKEY")
+    check("16. HIRA 전체 적재(mock) — 삭제 행 제외", len(hp) == 1 and hp[0]["mdsCd"] == "1234500100000")
+
+    detail_payload = {
+        "header": {"resultCode": "00"},
+        "body": {"items": [
+            {"ITEM_SEQ": "1001", "ITEM_NAME": "온코정 100mg", "ENTP_NAME": "온코팜",
+             "MAIN_ITEM_INGR": "[A12345]온코정성분", "BAR_CODE": "8801234500128",
+             "EE_DOC_DATA": "<DOC><TITLE>효능효과</TITLE><TEXT>위암 환자의 치료</TEXT></DOC>",
+             "UD_DOC_DATA": "", "NB_DOC_DATA": "", "ITEM_ENG_NAME": "", "MAIN_INGR_ENG": "",
+             "ETC_OTC_CODE": "", "ATC_CODE": "", "MATERIAL_NAME": "", "PACK_UNIT": "",
+             "VALID_TERM": "", "STORAGE_METHOD": "", "CHART": "", "EDI_CODE": ""},
+        ]},
+    }
+    with _umock.patch("modules.mfds_api.requests.get", return_value=_make_resp(detail_payload)):
+        det = mfds_api.get_product_detail("1001", "TESTKEY")
+    check("16. MFDS 상세(mock) — 성분명 대괄호 코드 제거", det["성분명"] == "온코정성분")
+    check("16. MFDS 상세(mock) — 효능효과 XML 파싱(원문 유지)", "위암 환자의 치료" in det["효능효과"])
+    check("16. MFDS 상세(mock) — 바코드 보존", det["바코드(표준코드)"] == "8801234500128")
+
+    # ---- 17) v4.1+ 오류 봉투·페이지네이션·키 인코딩 ----
+    key_enc = mfds_api.prep_service_key("abc%2Bdef%3Dg")
+    check("17. serviceKey 이중 인코딩 방지(unquote 1회)", key_enc == "abc+def=g", key_enc)
+    err_payload = {"OpenAPI_ServiceResponse": {"cmmMsgHeader": {
+        "errMsg": "SERVICE_KEY_IS_NOT_REGISTERED_ERROR",
+        "returnAuthMsg": "등록되지 않은 서비스키", "returnReasonCode": "30"}}}
+    try:
+        with _umock.patch("modules.mfds_api.requests.get", return_value=_make_resp(err_payload)):
+            mfds_api.fetch_all_products("BADKEY")
+        check("17. 오류 봉투 → 명확한 한국어 메시지", False)
+    except mfds_api.MfdsApiError as e:
+        check("17. 오류 봉투 → 명확한 한국어 메시지", "등록되지 않은 서비스키" in str(e), str(e))
+
+    # 페이지네이션: totalCount=1500 / numOfRows=500 → 3페이지, mock 호출 3번
+    pages = []
+    for pn in (1, 2, 3):
+        pages.append(_make_resp({"header": {"resultCode": "00"}, "body": {"totalCount": 1500, "items": {"item": [
+            {"ITEM_SEQ": f"S{pn}{i}", "ITEM_NAME": f"품목{pn}-{i}", "ENTP_NAME": "온코팜", "CANCEL_NAME": "정상", "ITEM_PERMIT_DATE": ""}
+            for i in range(500)]}}}))
+    call_count = {"n": 0}
+
+    def _side(*a, **k):
+        call_count["n"] += 1
+        return pages[call_count["n"] - 1]
+
+    with _umock.patch("modules.mfds_api.requests.get", side_effect=_side):
+        pag = mfds_api.fetch_all_products("K")
+    check("17. 페이지네이션 3페이지 수집", len(pag) == 1500 and call_count["n"] == 3, f"{len(pag)}건/{call_count['n']}회")
 
     print()
     print("=" * 60)
