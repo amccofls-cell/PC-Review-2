@@ -1,5 +1,3 @@
-2026.09.03 ver. made by Genspark, 의약품 허가사항 및 약가 원본 불러오기 및 로직상의 비교
-
 # 의약품 심의자료 진위·오탈자 검증기 v4.0
 
 병원 약제부가 신규의약품 심의자료(비교표)를 작성할 때, 그 내용을 **식품의약품안전처(MFDS) 허가사항**과
@@ -46,7 +44,7 @@ drug-review-validator/
 
 | API | URL |
 |---|---|
-| MFDS 목록 | `http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07` |
+| MFDS 목록 | `https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07` |
 | MFDS 상세 | `https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06` |
 | HIRA 약가 | `https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList` |
 
@@ -55,15 +53,27 @@ drug-review-validator/
 - HIRA: 「약가정보」서비스 (B551182)
 - 하나의 data.go.kr 키로 두 서비스를 모두 활용 가능(활용신청 필요)
 
-## 사용 흐름 (STEP 1~6)
+## 사용 흐름 (v4.1)
 
-1. **제품 검색·선택** — 제품명/제조사명 부분 검색 → 신청의약품 1개 + 비교의약품 N개 지정
-2. **자동 조회** — MFDS 상세 허가사항 + HIRA 약가 + 제품 매칭(8자리 바코드 규칙), 원문은 펼쳐서 확인
+0. **전체 데이터 불러오기 (1회)** — 사이드바에 MFDS/HIRA 인증키 입력 → 「📥 전체 데이터 불러오기」 실행.
+   MFDS 품목목록 → `data/cache/mfds_products.json`, HIRA 약가목록 → `data/cache/hira_prices.json` 으로 저장.
+   이후 모든 검색은 이 캐시 기준 로컬 필터링이라 **검색할 때마다 API를 호출하지 않습니다**.
+1. **제품 검색·선택** — 캐시에서 제품명/제조사명 부분 검색(API 호출 없음) → 신청의약품 1개 + 비교의약품 N개 지정
+2. **자동 조회** — MFDS 상세 허가사항만 선택 제품당 1회 조회, HIRA 약가는 캐시에서 8자리 바코드 규칙으로 매칭.
+   원문은 펼쳐서 확인(요약 아님)
 3. **비교표 입력** — PPTX 업로드 / XLSX 업로드 / 복사·붙여넣기 (3-way)
 4. **구조 확인** — 행=항목/열=제품 방향 자동 추정, 틀리면 수동 지정, 공통 스키마로 변환
 5. **1차 자동 검증** — 기본정보·숫자단위·약가만 기계 판정, 나머지는 🟠 Claude 확인 필요
 6. **Claude 검증 자료 생성** — 전체/제품별/항목별 복사 버튼(JS 클립보드) → Claude 웹에 붙여넣기 →
    결과(마크다운/JSON)를 다시 붙여넣으면 판정 표로 렌더링
+
+## v4.1 주요 변경점
+
+- **HTTPS 엔드포인트 하드코딩** — `http://`(포트 80) 잔재 제거, 연결 오류 시 3회 재시도.
+  (이전 ‘Connection to apis.data.go.kr:80 timed out’ 원인 해소)
+- **serviceKey 이중 인코딩 방지** — 이미 URL 인코딩된 키(%2B 등)를 1회 디코딩 후 전송.
+- **검색 캐시화** — 사이드바에서 키 입력 후 「전체 데이터 불러오기」 1회로 전체 목록을 JSON 캐시로 저장,
+  이후 검색·목록·HIRA 매칭은 캐시 기반 로컬 연산. 캐시가 없으면 “먼저 데이터 불러오기를 실행하세요” 안내.
 
 ## Streamlit Cloud 배포
 

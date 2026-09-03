@@ -1,49 +1,68 @@
 # -*- coding: utf-8 -*-
 """
-의약품 심의자료 진위·오탈자 검증기 v4.0 — Streamlit 웹앱 엔트리포인트 (명세서 6장 STEP 1~6)
+의약품 심의자료 진위·오탈자 검증기 v4.1 — Streamlit 웹앱 엔트리포인트
 
-원칙(명세서 2장):
-- Claude API 를 호출하는 코드는 일절 없다. API Key 입력창도 없다.
-- 앱은 "Claude 웹에 붙여넣을 검증 자료"를 생성·복사해 주는 역할만 한다.
-- API 키는 Streamlit Secrets 에서만 읽는다 (하드코딩 금지).
-- 서버 영구 저장 없음 — 모든 상태는 st.session_state(세션 범위)에서만 유지한다.
+v4.1 변경점 (사용자 피드백 반영):
+1. HTTPS 엔드포인트 하드코딩 + serviceKey 이중 인코딩 방지 + 연결 재시도(3회)
+   → 이전 'Connection to apis.data.go.kr:80 timed out' 원인 제거.
+2. 검색할 때마다 API를 호출하지 않음:
+   사이드바에서 인증키 입력 → 「전체 데이터 불러오기」를 1회 실행하면
+   MFDS 품목목록 → data/cache/mfds_products.json, HIRA 약가목록 → data/cache/hira_prices.json 으로 저장.
+   이후 의약품 검색·목록·HIRA 매칭은 모두 세션 메모리에 올린 캐시 기준 로컬 필터링(API 호출 없음).
+   MFDS 상세 허가사항만 선택 제품에 대해 제품당 1회 조회한다.
+3. 캐시가 없으면 「먼저 데이터 불러오기를 실행하세요」 안내 — 가짜 데이터를 만들지 않는다.
+
+고정 원칙(명세서 2장·12장 유지):
+- Claude API 호출 코드 없음, API Key 입력창(설정창) 없음 — 앱은 Claude 웹용 검증 자료 생성·복사만.
+- CSV 필수 중간 파일 없음, 서버 영구 저장 없음(세션 + 로컬 캐시 파일만), API 키 하드코딩 없음.
 """
-import re
 import json
+import re
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 import streamlit.components.v1 as components
 
-from modules import mfds_api, hira_api, drug_matcher
-from modules import pptx_parser, xlsx_parser, clipboard_parser
+from modules import cache_store, claude_prompt_builder, clipboard_parser, drug_matcher
+from modules import hira_api, mfds_api, pptx_parser, result_parser, rule_validator
 from modules import table_normalizer as normalizer
-from modules import rule_validator
-from modules import claude_prompt_builder, result_parser
+from modules import xlsx_parser
 
-st.set_page_config(page_title="의약품 심의자료 검증기 v4.0", page_icon="💊", layout="wide")
+st.set_page_config(page_title="의약품 심의자료 검증기 v4.1", page_icon="💊", layout="wide")
 
-# ---------------- 상태 초기화 ----------------
 _SS = st.session_state
-_SS.setdefault("search_rows", [])
-_SS.setdefault("products", [])
-_SS.setdefault("table", None)
-_SS.setdefault("pairs", [])
-_SS.setdefault("validation_df", None)
-_SS.setdefault("orientation", normalizer.ORIENT_ROWS_ARE_ITEMS)
+
+# ---------------- 상태 키 초기화 ----------------
+for _k, _v in {
+    "search_rows": [], "products": [], "table": None, "pairs": [],
+    "validation_df": None, "orientation": normalizer.ORIENT_ROWS_ARE_ITEMS,
+}.items():
+    _SS.setdefault(_k, _v)
+
+# 시작 시 로컬 캐시(JSON) 자동 로드 — 있으면 API 호출 없이 그대로 사용
+if "mfds_items" not in _SS:
+    _p = cache_store.load_cache(cache_store.MFDS_CACHE_FILE)
+    _SS["mfds_items"] = _p["items"] if _p else None
+    _SS["mfds_meta"] = _p
+if "hira_items" not in _SS:
+    _p = cache_store.load_cache(cache_store.HIRA_CACHE_FILE)
+    _SS["hira_items"] = _p["items"] if _p else None
+    _SS["hira_meta"] = _p
+
+
+def secrets_value(*keys, default=""):
+    """Streamlit Secrets 에서 우선순위대로 값을 읽는다. 미설정이어도 크래시하지 않는다."""
+    try:
+        for k in keys:
+            v = st.secrets.get(k)
+            if v:
+                return v
+    except Exception:
+        pass
+    return default
 
 
 # ---------------- 헬퍼 ----------------
-def get_secrets():
-    """Streamlit Secrets 에서 인증키 로드. 없으면 빈 문자열(크래시 방지)."""
-    try:
-        mfds_key = st.secrets.get("MFDS_API_KEY", "") or st.secrets.get("DATA_GO_KOR_API_KEY", "")
-        hira_key = st.secrets.get("HIRA_API_KEY", "") or st.secrets.get("DATA_GO_KOR_API_KEY", "")
-        return mfds_key, hira_key
-    except Exception:
-        return "", ""
-
-
 def label_of(row):
     return f"{row['ITEM_NAME']} | {row['ENTP_NAME']} | {row['ITEM_SEQ']}"
 
@@ -104,7 +123,7 @@ def mfds_reference_text(detail, field):
     """항목별 MFDS 원문 텍스트 추출 (요약하지 않음)."""
     if not detail or detail.get("error"):
         return None
-    if field in ("제품명",):
+    if field == "제품명":
         return detail.get("제품명")
     if field == "성분명":
         return detail.get("성분명")
@@ -125,7 +144,6 @@ def mfds_reference_text(detail, field):
     if field in nb_map:
         nb = detail.get("사용상주의사항") or {}
         return nb.get(nb_map[field])
-    # 그 외 서술형: 전체 사용상주의사항 중 해당 키워드 섹션 또는 전체 텍스트
     return None
 
 
@@ -155,120 +173,175 @@ def pairs_for_product(product, pairs, products):
 
 # ---------------- 사이드바 ----------------
 with st.sidebar:
-    st.markdown("## 💊 검증기 v4.0")
-    st.caption("MFDS 허가사항 · HIRA 약가정보와 심의자료 비교표를 대조합니다.")
-    mfds_key, hira_key = get_secrets()
-    if not mfds_key and not hira_key:
-        st.warning("API 인증키가 설정되지 않았습니다. Streamlit Secrets 에 MFDS_API_KEY / HIRA_API_KEY 를 설정해 주세요.")
-    elif not mfds_key:
-        st.warning("MFDS_API_KEY 가 없습니다. MFDS 조회가 불가능합니다.")
-    elif not hira_key:
-        st.warning("HIRA_API_KEY 가 없습니다. 약가조회가 불가능합니다.(MFDS는 정상 동작)")
-    st.divider()
-    st.caption("사용 흐름: ① 검색·선택 → ② 자동조회 → ③ 비교표 입력 → ④ 구조 확인 → ⑤ 1차 검증 → ⑥ Claude 검증 자료 생성")
+    st.markdown("## 💊 검증기 v4.1")
+    st.caption("MFDS 허가사항 · HIRA 약가정보 대조 검증")
 
-# ---------------- 본문 ----------------
-st.title("의약품 심의자료 진위·오탈자 검증기 v4.0")
-st.caption(
-    "기계적으로 확실한 항목(기본정보·숫자단위·약가)은 Python이 자동 판정하고, "
-    "의미 비교가 필요한 항목은 Claude 웹 검증용 자료를 자동 생성해 드립니다. "
-    "(이 앱은 Claude API를 호출하지 않습니다.)"
-)
+    mfds_key_in = st.text_input(
+        "MFDS 인증키", type="password",
+        value=secrets_value("MFDS_API_KEY", "DATA_GO_KOR_API_KEY"))
+    hira_key_in = st.text_input(
+        "HIRA 인증키", type="password",
+        value=secrets_value("HIRA_API_KEY", "DATA_GO_KOR_API_KEY"))
+    st.caption("키는 세션에서만 사용하며 저장하지 않습니다.")
 
-# ============ STEP 1. 검색 / 선택 ============
-st.markdown("## ① STEP 1. 의약품 검색·선택")
-with st.form("search_form", clear_on_submit=False):
-    keyword = st.text_input("제품명 또는 제조사명 부분 입력", placeholder="예: 아타칸정, 한미약품")
-    submitted = st.form_submit_button("🔍 MFDS에서 검색")
-if submitted:
-    _SS["search_rows"] = []
-    if not keyword.strip():
-        st.error("검색어를 입력해 주세요.")
-    elif not mfds_key:
-        st.error("MFDS 인증키가 없습니다. Streamlit Secrets에 MFDS_API_KEY를 설정해 주세요.")
-    else:
-        try:
-            with st.spinner("MFDS 목록에서 검색 중... (최대 5,000건 스캔)"):
-                rows = mfds_api.search_products(keyword.strip(), mfds_key)
-            if not rows:
-                st.warning("검색 결과가 없습니다. 제품명/제조사명 표기를 확인해 주세요. (취하·말소 품목은 제외됩니다)")
-            else:
-                _SS["search_rows"] = rows
-                st.success(f"{len(rows)}건 발견됨")
-        except mfds_api.MfdsApiError as e:
-            st.error(f"MFDS 검색 실패: {e}")
-
-# ============ STEP 2. 자동 조회 ============
-st.markdown("## ② STEP 2. 허가사항·약가 자동 조회")
-if _SS["search_rows"]:
-    options = [label_of(r) for r in _SS["search_rows"]]
-    c1, c2 = st.columns(2)
-    applicant = c1.selectbox("신청의약품 (1개)", ["-- 선택 --"] + options, key="applicant_sel")
-    comparators = c2.multiselect("비교의약품 (여러 개)", options, key="comparator_sel")
-
-    if st.button("🚀 허가사항·약가 조회 시작", type="primary", key="fetch_btn"):
-        sel = []
-        if st.session_state.applicant_sel != "-- 선택 --":
-            sel.append(("신청의약품", st.session_state.applicant_sel))
-        for i, lb in enumerate(st.session_state.comparator_sel, start=1):
-            sel.append((f"비교의약품{i}", lb))
-        if not sel:
-            st.warning("조회할 제품을 선택해 주세요 (신청의약품 1개 + 비교의약품).")
+    if st.button("📥 전체 데이터 불러오기 (1회)", type="primary"):
+        mfds_key = mfds_key_in.strip()
+        hira_key = hira_key_in.strip()
+        if not mfds_key:
+            st.error("MFDS 인증키를 입력해 주세요.")
         else:
             bar = st.progress(0.0)
             status_txt = st.empty()
-            products = []
-            for i, (role, lb) in enumerate(sel):
-                seq = lb.split(" | ")[-1].strip()
-                status_txt.info(f"({i+1}/{len(sel)}) {lb} → MFDS 상세 + HIRA 약가 조회 중...")
+            try:
+                items = mfds_api.fetch_all_products(
+                    mfds_key,
+                    progress_cb=lambda f, n: (bar.progress(f), status_txt.caption(f"MFDS 품목목록: {n:,}건 수집중...")))
+                meta = cache_store.save_cache(cache_store.MFDS_CACHE_FILE, items, {"service": "MFDS 품목허가"})
+                _SS["mfds_items"], _SS["mfds_meta"] = items, meta
+                st.success(f"MFDS {len(items):,}건 적재 완료 — {meta['loaded_at']}")
+            except mfds_api.MfdsApiError as e:
+                st.error(f"MFDS 적재 실패: {e}")
+            if hira_key:
+                bar2 = st.progress(0.0)
+                status_txt2 = st.empty()
                 try:
-                    detail = mfds_api.get_product_detail(seq, mfds_key)
-                    detail_ok = not detail.get("error")
-                except mfds_api.MfdsApiError as e:
-                    detail = {"error": str(e)}
-                    detail_ok = False
-                hira_rows, match = [], {"status": drug_matcher.STATUS_FAIL, "row": None, "method": None}
-                if detail_ok:
+                    items2 = hira_api.fetch_all_drug_prices(
+                        hira_key,
+                        progress_cb=lambda f, n: (bar2.progress(f), status_txt2.caption(f"HIRA 약가: {n:,}건 수집중...")))
+                    meta2 = cache_store.save_cache(cache_store.HIRA_CACHE_FILE, items2, {"service": "HIRA 약가"})
+                    _SS["hira_items"], _SS["hira_meta"] = items2, meta2
+                    st.success(f"HIRA {len(items2):,}건 적재 완료 — {meta2['loaded_at']}")
+                except hira_api.HiraApiError as e:
+                    st.error(f"HIRA 적재 실패: {e}")
+            else:
+                st.caption("HIRA 키 미입력 — 약가 목록은 불러오지 않습니다.")
+    st.divider()
+    st.markdown("**캐시 상태 (data/cache/*.json)**")
+    if _SS.get("mfds_items"):
+        st.info(f"✅ MFDS {len(_SS['mfds_items']):,}건\n적재시각: {(_SS.get('mfds_meta') or {}).get('loaded_at', '?')}")
+    else:
+        st.warning("❌ MFDS 데이터 없음 — 「전체 데이터 불러오기」 실행")
+    if _SS.get("hira_items"):
+        st.info(f"✅ HIRA {len(_SS['hira_items']):,}건\n적재시각: {(_SS.get('hira_meta') or {}).get('loaded_at', '?')}")
+    else:
+        st.warning("❌ HIRA 데이터 없음 — 키 입력 후 불러오기 실행")
+    if st.button("🔄 세션에 캐시 다시 로드"):
+        _p = cache_store.load_cache(cache_store.MFDS_CACHE_FILE)
+        if _p:
+            _SS["mfds_items"], _SS["mfds_meta"] = _p["items"], _p
+            st.success(f"MFDS 캐시 {len(_p['items']):,}건 로드")
+        else:
+            st.warning("MFDS 캐시 파일이 없습니다.")
+        _p2 = cache_store.load_cache(cache_store.HIRA_CACHE_FILE)
+        if _p2:
+            _SS["hira_items"], _SS["hira_meta"] = _p2["items"], _p2
+            st.success(f"HIRA 캐시 {len(_p2['items']):,}건 로드")
+        else:
+            st.warning("HIRA 캐시 파일이 없습니다.")
+    st.divider()
+    st.caption("사용 흐름: ① 데이터 불러오기(1회) → ② 검색·선택 → ③ 자동조회 → ④ 비교표 입력 → ⑤ 구조 확인 → ⑥ 1차 검증 → ⑦ Claude 자료 생성")
+
+# ---------------- 본문 ----------------
+st.title("의약품 심의자료 진위·오탈자 검증기 v4.1")
+st.caption(
+    "기계적으로 확실한 항목(기본정보·숫자단위·약가)은 Python이 자동 판정하고, 의미 비교는 Claude 웹용 자료를 생성해 드립니다. "
+    "(Claude API를 호출하지 않습니다.) 의약품 검색은 불러온 캐시(JSON) 기준 로컬 필터링 — 검색마다 API를 호출하지 않습니다."
+)
+
+# ============ ① 검색·선택 (캐시 기반, API 호출 없음) ============
+st.markdown("## ① 의약품 검색·선택 (캐시 기반)")
+with st.form("search_form"):
+    keyword = st.text_input("제품명 또는 제조사명 부분 입력", placeholder="예: 아타칸정, 한미약품")
+    submitted = st.form_submit_button("🔍 검색")
+if submitted:
+    if not _SS.get("mfds_items"):
+        st.error("MFDS 데이터가 없습니다. 먼저 사이드바에서 「📥 전체 데이터 불러오기」를 실행해 주세요.")
+        _SS["search_rows"] = []
+    else:
+        with st.spinner("로컬 캐시에서 검색 중..."):
+            _SS["search_rows"] = cache_store.filter_products(_SS["mfds_items"], keyword)
+        if not _SS["search_rows"]:
+            st.warning("검색 결과가 없습니다. (캐시 기준 — 취하·말소 품목 제외)")
+        else:
+            st.success(f"{len(_SS['search_rows'])}건 — 로컬 캐시 검색(API 호출 없음)")
+
+if _SS["search_rows"]:
+    options = [label_of(r) for r in _SS["search_rows"]]
+    c1, c2 = st.columns(2)
+    c1.selectbox("신청의약품 (1개)", ["-- 선택 --"] + options, key="applicant_sel")
+    c2.multiselect("비교의약품 (여러 개)", options, key="comparator_sel")
+
+# ============ ② 자동 조회 (MFDS 상세만 1회, HIRA는 캐시) ============
+st.markdown("## ② 허가사항·약가 자동 조회")
+if _SS["search_rows"] and st.button("🚀 조회 시작 (MFDS 상세 1회/제품 · HIRA는 캐시에서 매칭)", type="primary", key="fetch_btn"):
+    sel = []
+    if st.session_state.get("applicant_sel", "-- 선택 --") != "-- 선택 --":
+        sel.append(("신청의약품", st.session_state.applicant_sel))
+    for i, lb in enumerate(st.session_state.get("comparator_sel", []), start=1):
+        sel.append((f"비교의약품{i}", lb))
+    mfds_key = mfds_key_in.strip() or secrets_value("MFDS_API_KEY", "DATA_GO_KOR_API_KEY")
+    hira_key = hira_key_in.strip() or secrets_value("HIRA_API_KEY", "DATA_GO_KOR_API_KEY")
+    if not sel:
+        st.warning("조회할 제품을 선택해 주세요 (신청의약품 1개 + 비교의약품).")
+    elif not mfds_key:
+        st.error("MFDS 인증키가 없습니다. 사이드바에 입력해 주세요.")
+    else:
+        bar = st.progress(0.0)
+        status_txt = st.empty()
+        products = []
+        for i, (role, lb) in enumerate(sel):
+            seq = lb.split(" | ")[-1].strip()
+            status_txt.info(f"({i+1}/{len(sel)}) {lb} → MFDS 상세 조회 중...")
+            try:
+                detail = mfds_api.get_product_detail(seq, mfds_key)
+                detail_ok = not detail.get("error")
+            except mfds_api.MfdsApiError as e:
+                detail = {"error": str(e)}
+                detail_ok = False
+            hira_rows, match = [], {"status": drug_matcher.STATUS_FAIL, "row": None, "method": None}
+            if detail_ok:
+                if _SS.get("hira_items"):
+                    match = drug_matcher.match_hira(detail, _SS["hira_items"])
+                    hira_rows = [match["row"]] if match.get("row") else []
+                elif hira_key:
                     try:
                         hira_rows = hira_api.search_for_product(detail, hira_key)
                         match = drug_matcher.match_hira(detail, hira_rows)
                     except hira_api.HiraApiError as e:
                         match = {"status": f"⚠ HIRA 조회 실패: {e}", "row": None, "method": None}
-                price = None
-                if match.get("row"):
-                    try:
-                        price = float(str(match["row"].get("mxCprc") or "").replace(",", ""))
-                    except (TypeError, ValueError):
-                        price = None
-                products.append({
-                    "label": lb, "role": role, "seq": seq,
-                    "detail": detail, "hira_rows": hira_rows, "match": match, "price": price,
-                })
-                bar.progress((i + 1) / len(sel))
-            status_txt.empty()
-            _SS["products"] = products
-            st.success("조회 완료")
+                else:
+                    match = {"status": "⚠ HIRA 캐시·키 없음 — 사이드바에서 데이터 불러오기 실행", "row": None, "method": None}
+            price = None
+            if match.get("row"):
+                price = hira_api.get_price(match["row"])
+            products.append({
+                "label": lb, "role": role, "seq": seq,
+                "detail": detail, "hira_rows": hira_rows, "match": match, "price": price,
+            })
+            bar.progress((i + 1) / len(sel))
+        status_txt.empty()
+        _SS["products"] = products
+        st.success("조회 완료")
 
 if _SS["products"]:
     st.markdown("#### 조회 요약")
     rows = []
     for p in _SS["products"]:
-        d = p["detail"]
-        m = p["match"]
+        d, m = p["detail"], p["match"]
         rows.append({
             "구분": p["role"],
             "제품": p["label"].split(" | ")[0],
-            "MFDS": "✅ 조회됨" if not d.get("error") else "❌ 실패",
-            "HIRA": f"✅ {len(p['hira_rows'])}건" if p["hira_rows"] else ("❌ 없음/실패" if not d.get("error") else "—"),
+            "MFDS": "✅" if not d.get("error") else "❌",
+            "HIRA": "✅" if p["hira_rows"] else ("⚠" if d.get("error") else "❌"),
             "제품 매칭": m.get("status", drug_matcher.STATUS_FAIL),
             "약가(원)": f"{p['price']:,.0f}" if p["price"] is not None else "—",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
     for p in _SS["products"]:
-        with st.expander(f"📄 원문 보기 — {p['role']} / {p['label'].split(' | ')[0]} (MFDS 허가사항·HIRA 약가정보 원문, 요약 아님)"):
+        with st.expander(f"📄 원문 보기 — {p['role']} / {p['label'].split(' | ')[0]} (원문, 요약 아님)"):
             st.markdown("**MFDS 허가사항 원문**")
             st.text(mfds_api.detail_to_raw_text(p["detail"]))
-            st.markdown("**HIRA 약가정보 원문**")
+            st.markdown("**HIRA 약가정보 (매칭 결과)**")
             if p["hira_rows"]:
                 for r in p["hira_rows"]:
                     st.text(
@@ -276,10 +349,10 @@ if _SS["products"]:
                         f"상한금액: {r.get('mxCprc')}원 / 급여구분: {r.get('payTpNm')} / 약효분류: {r.get('meftDivNo')}"
                     )
             else:
-                st.caption("(HIRA 약가정보 없음 — 품목명 재검색 또는 분업예외 등 사유 확인 필요)")
+                st.caption("(HIRA 매칭 결과 없음 — 캐시 재적재 또는 키 확인 필요)")
 
-# ============ STEP 3. 비교표 입력 ============
-st.markdown("## ③ STEP 3. 심의자료 비교표 입력")
+# ============ ③ 비교표 입력 ============
+st.markdown("## ③ 심의자료 비교표 입력")
 tab1, tab2, tab3 = st.tabs(["📊 PPTX 업로드", "📈 XLSX 업로드", "📋 복사·붙여넣기"])
 
 with tab1:
@@ -312,8 +385,8 @@ with tab3:
         except clipboard_parser.ClipboardParseError as e:
             st.error(str(e))
 
-# ============ STEP 4. 구조 확인 ============
-st.markdown("## ④ STEP 4. 비교표 구조 확인")
+# ============ ④ 구조 확인 ============
+st.markdown("## ④ 비교표 구조 확인")
 if _SS["table"] is not None:
     tbl = _SS["table"]
     st.caption(f"출처: {tbl['source']} / 슬라이드·시트: {tbl['slide']} / 표 순번: {tbl['table_index']}")
@@ -330,19 +403,16 @@ if _SS["table"] is not None:
     _SS["orientation"] = orient
     pairs = normalizer.to_field_product_pairs(tbl, orient)
     _SS["pairs"] = pairs
-    preview = []
-    for r in tbl["rows"]:
-        preview.append([c.get("text", "") for c in r])
+    preview = [[c.get("text", "") for c in r] for r in tbl["rows"]]
     st.markdown("**원본 표 그리드** (병합은 시작셀에 colspan/rowspan 정보 유지)")
     maxcols = max((len(r) for r in preview), default=1)
-    preview_df = pd.DataFrame(preview, columns=[f"C{i+1}" for i in range(maxcols)])
-    st.dataframe(preview_df, use_container_width=True)
+    st.dataframe(pd.DataFrame(preview, columns=[f"C{i+1}" for i in range(maxcols)]), use_container_width=True)
     st.markdown(f"**공통 스키마 변환 결과: {len(pairs)}개 셀** (명세서 8장 형식)")
     if pairs:
         st.dataframe(pd.DataFrame(pairs), use_container_width=True)
 
-# ============ STEP 5. 1차 자동 검증 ============
-st.markdown("## ⑤ STEP 5. Python 1차 자동 검증")
+# ============ ⑤ 1차 자동 검증 ============
+st.markdown("## ⑤ Python 1차 자동 검증")
 if _SS.get("products") and _SS.get("pairs"):
     if st.button("🔍 1차 규칙 검증 실행 (기본정보·숫자단위·약가만)", key="validate_btn"):
         products = _SS["products"]
@@ -363,9 +433,8 @@ if _SS.get("products") and _SS.get("pairs"):
     if _SS.get("validation_df") is not None:
         vdf = _SS["validation_df"]
         st.dataframe(style_df(vdf, "1차 판정"), use_container_width=True)
-        st.caption("🟠 Claude 확인 필요 항목은 Python이 판정하지 않습니다. ⑥ 단계에서 생성되는 자료를 Claude 웹에 붙여넣어 의미 검증하세요.")
+        st.caption("🟠 Claude 확인 필요 항목은 Python이 판정하지 않습니다. ⑥ 단계 자료를 Claude 웹에 붙여넣어 의미 검증하세요.")
 
-        # ── 약가 차이율 카드 (명세서 7장) ──
         products = _SS["products"]
         applicant = next((p for p in products if "신청" in p["label"]), None)
         comps = [p for p in products if p is not applicant]
@@ -389,8 +458,8 @@ if _SS.get("products") and _SS.get("pairs"):
 else:
     st.caption("② 단계에서 제품을 조회하고 ③~④ 단계에서 비교표를 인식해야 검증할 수 있습니다.")
 
-# ============ STEP 6. Claude 검증 자료 생성 ============
-st.markdown("## ⑥ STEP 6. Claude 검증 자료 생성 (웹에서 의미 검증)")
+# ============ ⑥ Claude 검증 자료 생성 ============
+st.markdown("## ⑥ Claude 검증 자료 생성 (웹에서 의미 검증)")
 if _SS.get("products") and _SS.get("pairs"):
     products = _SS["products"]
     prompt_products = []
@@ -434,10 +503,12 @@ if _SS.get("products") and _SS.get("pairs"):
         parsed = result_parser.parse_result(claude_out)
         if parsed["ok"]:
             rdf = pd.DataFrame(parsed["rows"])
+            styler = None
             try:
-                st.dataframe(rdf.style.map(status_color_rule, subset=["판단"]), use_container_width=True)
+                styler = rdf.style.map(status_color_rule, subset=["판단"])
             except AttributeError:
-                st.dataframe(rdf.style.applymap(status_color_rule, subset=["판단"]), use_container_width=True)
+                styler = rdf.style.applymap(status_color_rule, subset=["판단"])
+            st.dataframe(styler, use_container_width=True)
         else:
             st.error(parsed["error"])
             st.markdown("**입력 원문 (그대로)**")
@@ -449,5 +520,5 @@ st.divider()
 st.caption(
     "⚠️ 본 앱은 기계적으로 판별 가능한 항목(기본정보·숫자단위·약가)만 자동 판정합니다. "
     "의미 비교는 Claude 웹에서 수행하며, 본 앱은 그 자료를 생성·복사하는 역할만 합니다. "
-    "API 오류 시 데이터를 임의로 생성하지 않습니다."
+    "API 오류·캐시 부재 시 데이터를 임의로 생성하지 않습니다."
 )
