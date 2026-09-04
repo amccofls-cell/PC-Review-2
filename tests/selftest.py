@@ -20,7 +20,7 @@ from pptx import Presentation
 from modules import (
     mfds_api, hira_api, drug_matcher, pptx_parser, xlsx_parser, clipboard_parser,
     table_normalizer as normalizer, rule_validator, claude_prompt_builder, result_parser,
-    cache_store,
+    cache_store, grouping,
 )
 
 PASS, FAIL = "PASS", "FAIL"
@@ -305,18 +305,58 @@ def main():
     check("16. MFDS 상세(mock) — 효능효과 XML 파싱(원문 유지)", "위암 환자의 치료" in det["효능효과"])
     check("16. MFDS 상세(mock) — 바코드 보존", det["바코드(표준코드)"] == "8801234500128")
 
-    # ---- 17) v4.1+ 오류 봉투·페이지네이션·키 인코딩 ----
+    # ---- 17) 그룹 데이터모델 + 4그룹/3강도 시나리오 ----
+    legacy_groups = grouping.migrate_legacy(selection=["A100", "A200", "C100"], applicant_seq="A100", comparator_seqs=["A200"])
+    check("17. 구버전 상태 마이그레이션", legacy_groups["applicant"]["seqs"] == ["A100"] and "C100" in legacy_groups["comp1"]["seqs"])
+
+    groups = grouping.ensure_minimum_groups({
+        "applicant": {"label": "신청의약품", "seqs": ["N100", "N200", "N300"]},
+        "comp1": {"label": "비교의약품1", "seqs": ["F100", "F200", "F400"]},
+        "comp2": {"label": "비교의약품2", "seqs": ["A100", "A200", "A400"]},
+        "comp3": {"label": "비교의약품3", "seqs": ["I050", "I100", "I200"]},
+    })
+    by_seq = {
+        "N100": {"ITEM_SEQ": "N100", "ITEM_NAME": "나르코설하정100마이크로그램", "ENTP_NAME": "신청사"},
+        "N200": {"ITEM_SEQ": "N200", "ITEM_NAME": "나르코설하정200마이크로그램", "ENTP_NAME": "신청사"},
+        "N300": {"ITEM_SEQ": "N300", "ITEM_NAME": "나르코설하정300마이크로그램", "ENTP_NAME": "신청사"},
+        "F100": {"ITEM_SEQ": "F100", "ITEM_NAME": "펜토라박칼정100마이크로그램", "ENTP_NAME": "비교사1"},
+        "F200": {"ITEM_SEQ": "F200", "ITEM_NAME": "펜토라박칼정200마이크로그램", "ENTP_NAME": "비교사1"},
+        "F400": {"ITEM_SEQ": "F400", "ITEM_NAME": "펜토라박칼정400마이크로그램", "ENTP_NAME": "비교사1"},
+        "A100": {"ITEM_SEQ": "A100", "ITEM_NAME": "앱스트랄설하정100마이크로그램", "ENTP_NAME": "비교사2"},
+        "A200": {"ITEM_SEQ": "A200", "ITEM_NAME": "앱스트랄설하정200마이크로그램", "ENTP_NAME": "비교사2"},
+        "A400": {"ITEM_SEQ": "A400", "ITEM_NAME": "앱스트랄설하정400마이크로그램", "ENTP_NAME": "비교사2"},
+        "I050": {"ITEM_SEQ": "I050", "ITEM_NAME": "인스타닐나잘스프레이50마이크로그램", "ENTP_NAME": "비교사3"},
+        "I100": {"ITEM_SEQ": "I100", "ITEM_NAME": "인스타닐나잘스프레이100마이크로그램", "ENTP_NAME": "비교사3"},
+        "I200": {"ITEM_SEQ": "I200", "ITEM_NAME": "인스타닐나잘스프레이200마이크로그램", "ENTP_NAME": "비교사3"},
+    }
+    group_items = grouping.build_group_items(groups, by_seq)
+    check("17. 4그룹/3강도 시나리오 품목 수", len(group_items) == 12, f"{len(group_items)}건")
+    strengths = {row["seq"]: row["strength"] for row in group_items}
+    check("17. 제품명 기반 함량 파싱", strengths["N100"] == "100mcg" and strengths["F400"] == "400mcg" and strengths["I050"] == "50mcg", str(strengths))
+    reordered = grouping.assign_seqs_to_group(groups, "comp3", ["N300"])
+    check("17. 그룹 재지정 시 중복 제거", "N300" not in reordered["applicant"]["seqs"] and reordered["comp3"]["seqs"][-1] == "N300")
+
+    prompt_prods_group = [
+        {"label": "X", "prompt_label": "신청의약품 / 100mcg / 나르코설하정100마이크로그램", "role": "신청의약품", "detail": fake_detail, "hira_rows": [], "pairs": []},
+        {"label": "Y", "prompt_label": "비교의약품1 / 100mcg / 펜토라박칼정100마이크로그램", "role": "비교의약품1", "detail": fake_detail, "hira_rows": [], "pairs": []},
+        {"label": "Z", "prompt_label": "비교의약품2 / 100mcg / 앱스트랄설하정100마이크로그램", "role": "비교의약품2", "detail": fake_detail, "hira_rows": [], "pairs": []},
+        {"label": "W", "prompt_label": "비교의약품3 / 50mcg / 인스타닐나잘스프레이50마이크로그램", "role": "비교의약품3", "detail": fake_detail, "hira_rows": [], "pairs": []},
+    ]
+    full_group = claude_prompt_builder.build_full_prompt(prompt_prods_group)
+    check("17. 그룹 프롬프트 대상열거", all(x in full_group for x in ("신청의약품:", "비교의약품1:", "비교의약품2:", "비교의약품3:")))
+
+    # ---- 18) v4.1+ 오류 봉투·페이지네이션·키 인코딩 ----
     key_enc = mfds_api.prep_service_key("abc%2Bdef%3Dg")
-    check("17. serviceKey 이중 인코딩 방지(unquote 1회)", key_enc == "abc+def=g", key_enc)
+    check("18. serviceKey 이중 인코딩 방지(unquote 1회)", key_enc == "abc+def=g", key_enc)
     err_payload = {"OpenAPI_ServiceResponse": {"cmmMsgHeader": {
         "errMsg": "SERVICE_KEY_IS_NOT_REGISTERED_ERROR",
         "returnAuthMsg": "등록되지 않은 서비스키", "returnReasonCode": "30"}}}
     try:
         with _umock.patch("modules.mfds_api.requests.get", return_value=_make_resp(err_payload)):
             mfds_api.fetch_all_products("BADKEY")
-        check("17. 오류 봉투 → 명확한 한국어 메시지", False)
+        check("18. 오류 봉투 → 명확한 한국어 메시지", False)
     except mfds_api.MfdsApiError as e:
-        check("17. 오류 봉투 → 명확한 한국어 메시지", "등록되지 않은 서비스키" in str(e), str(e))
+        check("18. 오류 봉투 → 명확한 한국어 메시지", "등록되지 않은 서비스키" in str(e), str(e))
 
     # 페이지네이션: totalCount=1500 / numOfRows=500 → 3페이지, mock 호출 3번
     pages = []
@@ -332,7 +372,7 @@ def main():
 
     with _umock.patch("modules.mfds_api.requests.get", side_effect=_side):
         pag = mfds_api.fetch_all_products("K")
-    check("17. 페이지네이션 3페이지 수집", len(pag) == 1500 and call_count["n"] == 3, f"{len(pag)}건/{call_count['n']}회")
+    check("18. 페이지네이션 3페이지 수집", len(pag) == 1500 and call_count["n"] == 3, f"{len(pag)}건/{call_count['n']}회")
 
     print()
     print("=" * 60)
