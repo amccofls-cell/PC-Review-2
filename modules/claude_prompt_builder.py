@@ -12,10 +12,10 @@ PROMPT_ROLE = """[역할]
 
 PROMPT_PRINCIPLE = """[검증 원칙]
 - 아래 제공된 MFDS 허가사항 원문과 HIRA 약가정보, 그리고 심의자료 비교표만을 근거로 판단하라.
-- 너의 일반적인 의약학 지식, 인터넷 지식, 기억하는 허가사항으로 보완하지 마라. 근거가 없으면 "확인불가"로 답하라.
-- 문자열이 아니라 의미를 비교하라. 표현이 달라도 핵심 의미가 같으면 "표현차이"다.
+- 너의 일반적인 의약학 지식, 인터넷 지식, 기억하는 허가사항으로 보완하지 마라. 근거가 없으면 \"확인불가\"로 답하라.
+- 문자열이 아니라 의미를 비교하라. 표현이 달라도 핵심 의미가 같으면 \"표현차이\"다.
 - 대상환자·연령·이전치료 여부·병용치료·바이오마커·용량·투여횟수·투여기간·감량/중단 조건 등 핵심 조건이
-  삭제되어 범위가 넓어지거나, 원문에 없는 내용이 추가되어 있으면 "수정필요"다."""
+  삭제되어 범위가 넓어지거나, 원문에 없는 내용이 추가되어 있으면 \"수정필요\"다."""
 
 PROMPT_REQUEST = """[검증 요청]
 각 항목별로 비교표 내용이 위 원문과 의미상 일치하는지 판단하라.
@@ -44,8 +44,36 @@ NB_KEY_FOR_FIELD = {
 }
 
 
+def _display_label(product_record):
+    return product_record.get("prompt_label") or product_record.get("label") or "(품목)"
+
+
 def _product_block_header(product_record):
-    return f"--- {product_record['label']} ---"
+    return f"--- {_display_label(product_record)} ---"
+
+
+def _role_value(product_record):
+    return product_record.get("role") or product_record.get("group_label") or product_record.get("label") or ""
+
+
+def _target_lines(products):
+    applicant = [p for p in products if "신청" in _role_value(p)]
+    comparators = [p for p in products if p not in applicant]
+    if not applicant and products:
+        applicant = [products[0]]
+        comparators = products[1:]
+
+    parts = ["[검증 대상 제품]"]
+    applicant_labels = [_display_label(p) for p in applicant]
+    parts.append("신청의약품: " + (", ".join(applicant_labels) if applicant_labels else "(신청의약품)"))
+
+    comp_buckets = {}
+    for p in comparators:
+        role = _role_value(p)
+        comp_buckets.setdefault(role or "비교의약품", []).append(_display_label(p))
+    for role, labels in comp_buckets.items():
+        parts.append(f"{role}: " + ", ".join(labels))
+    return parts
 
 
 def _table_pairs_text(pairs):
@@ -92,18 +120,11 @@ def _hira_text(hira_rows):
 
 def build_full_prompt(products):
     """
-    products: [{"label", "detail", "hira_rows", "pairs"}...]
+    products: [{"label", "prompt_label", "role", "detail", "hira_rows", "pairs"}...]
     전체 자료(전 제품 × MFDS 원문 + HIRA + 비교표) 프롬프트를 생성한다.
     """
-    applicant = next((p for p in products if "신청" in p["label"]), products[0] if products else None)
-    comparator_labels = [p["label"] for p in products if p is not applicant]
-    applicant_name = applicant["label"] if applicant else "(신청의약품)"
-
     parts = [PROMPT_ROLE, PROMPT_PRINCIPLE]
-    parts.append("[검증 대상 제품]")
-    parts.append(f"신청의약품: {applicant_name}")
-    if comparator_labels:
-        parts.append("비교의약품: " + ", ".join(comparator_labels))
+    parts.extend(_target_lines(products))
 
     parts.append("\n[MFDS 허가사항 원문]")
     for p in products:
@@ -136,13 +157,7 @@ def build_field_prompt(field, products):
     MFDS 원문은 해당 항목 원문만, 비교표는 해당 항목 셀만 포함한다(요약 없음).
     """
     parts = [PROMPT_ROLE, PROMPT_PRINCIPLE]
-    applicant = next((p for p in products if "신청" in p["label"]), products[0] if products else None)
-    names = "신청의약품: " + (applicant["label"] if applicant else "(신청의약품)")
-    parts.append("[검증 대상 제품]")
-    parts.append(names)
-    comps = [p["label"] for p in products if p is not applicant]
-    if comps:
-        parts.append("비교의약품: " + ", ".join(comps))
+    parts.extend(_target_lines(products))
 
     parts.append("\n[MFDS 허가사항 원문 (해당 항목)]")
     for p in products:
